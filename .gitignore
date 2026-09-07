@@ -1,0 +1,30 @@
+# Credentials and local state
+.env
+.env.*
+!.env.example
+*.env
+*.pem
+*.key
+.yadisk-token.json
+.yadisk-tokens-*
+*token*.json
+config.json
+status.json
+last_result.json
+*.log
+paused
+run-now
+worker.lock
+# Generated artifacts / environments
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv*/
+venv/
+build/
+dist/
+*.app/
+*.whl
+*.zip
+.DS_Store
+.pytest_cache/
