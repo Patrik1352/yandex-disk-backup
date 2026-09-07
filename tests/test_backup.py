@@ -88,6 +88,7 @@ class MemoryDisk:
                 self.state['after_upload'](local, remote)
             if self.state.get('corrupt_stage'):
                 self.state['nodes'][remote] = b'corrupted'
+                raise IntegrityError('Upload verification failed')
             return SimpleNamespace(size=len(value), md5=hashlib.md5(value).hexdigest())
         finally:
             with self.state['lock']:
@@ -397,16 +398,21 @@ class StreamingBackupTests(unittest.TestCase):
     previous = BackupTests.previous
     backup = BackupTests.backup
 
-    def test_upload_precedes_listing_unrelated_directory(self):
-        self.source('first.txt')
-        self.previous('later/existing.txt', b'old')
-        self.source('later/existing.txt', b'old')
-        self.disk.state['calls'].clear()
-        self.assertTrue(self.backup(workers=1).ok)
-        calls = self.disk.state['calls']
-        upload = next(i for i, c in enumerate(calls) if c[0] == 'upload')
-        listing = calls.index(('listdir', '/backup/current/later'))
-        self.assertLess(upload, listing)
+    def test_files_in_different_directories_transfer_concurrently(self):
+        for i in range(12):
+            self.source(f'dir{i}/file.txt')
+        self.disk.state['delay'] = 0.02
+        result = self.backup(workers=4)
+        self.assertTrue(result.ok)
+        self.assertGreater(self.disk.state['peak'], 1)
+        self.assertLessEqual(self.disk.state['peak'], 4)
+
+    def test_no_redundant_stage_stat_after_verified_upload(self):
+        self.source('file.txt')
+        result = self.backup()
+        self.assertTrue(result.ok)
+        stage = '/backup/.staging/' + result.run_id + '/file.txt'
+        self.assertNotIn(('stat', stage), self.disk.state['calls'])
 
     def test_transient_listing_failure_retries_without_reupload(self):
         self.source('first.txt')

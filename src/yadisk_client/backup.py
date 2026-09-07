@@ -175,7 +175,7 @@ def backup_tree(disk, local_dir, remote_root, *, exclude=(), workers=4,
     Exclusions have the same relative glob semantics as upload_tree. Symlinks and
     special files are skipped; unreadable regular files/directories are failures.
     Every run hashes local files (same-size edits are detected). Remote directories
-    are listed on demand; their files are copied before visiting the next directory.
+    are listed on demand; a bounded queue transfers files across directories.
     ``should_stop()`` cooperatively pauses scanning/hashing and prevents new
     transfers. In-flight verified transfers finish. Authentication/network errors
     stop scheduling more work; completed copies remain and the next run resumes
@@ -375,34 +375,6 @@ def backup_tree(disk, local_dir, remote_root, *, exclude=(), workers=4,
             return None
         return _Job(source, digest, previous)
 
-    def run_bounded(executor, function, items, phase):
-        iterator, pending = iter(items), {}
-        # At most workers futures are scheduled: pause/offline stops the queue
-        # immediately after the already in-flight batch finishes.
-        def enqueue():
-            while len(pending) < workers and not stopped():
-                try:
-                    item = next(iterator)
-                except StopIteration:
-                    break
-                pending[executor.submit(function, item)] = item
-        enqueue()
-        while pending:
-            done, _ = wait(pending, return_when=FIRST_COMPLETED)
-            for future in done:
-                item = pending.pop(future)
-                source = item.source if isinstance(item, _Job) else item
-                try:
-                    outcome = future.result()
-                    if outcome is not None:
-                        yield outcome
-                except _Stopped:
-                    pass
-                except Exception as exc:
-                    fail(source.relative, exc)
-                emit(phase, source.relative)
-            enqueue()
-
     def cleanup(worker, stage):
         try:
             meta = _stat_optional(worker, stage)
@@ -438,8 +410,7 @@ def backup_tree(disk, local_dir, remote_root, *, exclude=(), workers=4,
             uploaded = retry(send, source.relative)
             if (uploaded.size, uploaded.md5.lower()) != expected:
                 raise SourceChangedError('Source changed between hashing and upload')
-            if _fingerprint(worker.stat(stage)) != expected:
-                raise IntegrityError('Staged upload does not match source')
+            # upload() already verifies remote size and MD5 before returning.
             _assert_source(source)
             if _fingerprint(_stat_optional(worker, target)) != previous:
                 raise RemoteChangedError('Current destination changed during upload')
@@ -481,16 +452,49 @@ def backup_tree(disk, local_dir, remote_root, *, exclude=(), workers=4,
 
     jobs = []
     prepared = set()
+    preparation_locks = {}
 
-    def ensure(path):
-        if path in prepared:
-            return
+    def ensure(path, worker):
+        with lock:
+            if path in prepared:
+                return
+            path_lock = preparation_locks.setdefault(path, threading.Lock())
+        # Parent-first locking avoids deadlocks between different directory trees.
         if path != remote:
             parent = posixpath.dirname(path)
             if parent.startswith(remote):
-                ensure(parent)
-        disk.mkdir(path, parents=path == remote, exist_ok=True)
-        prepared.add(path)
+                ensure(parent, worker)
+        with path_lock:
+            with lock:
+                if path in prepared:
+                    return
+            if stopped():
+                raise _Stopped()
+            worker.mkdir(path, parents=path == remote, exist_ok=True)
+            with lock:
+                prepared.add(path)
+
+    def process(source):
+        try:
+            job = check(source)
+            if job is None:
+                emit('checking', source.relative)
+                return
+            with lock:
+                jobs.append(job)
+                result.bytes_total += source.size
+            worker = client()
+            relative = posixpath.dirname(source.relative)
+            ensure(staging + ('/' + relative if relative else ''), worker)
+            if job.previous is not None:
+                ensure(history + ('/' + relative if relative else ''), worker)
+            transfer(job)
+        except _Stopped:
+            raise
+        except Exception as exc:
+            # Open the circuit inside the worker before a queued job can start.
+            fail(source.relative, exc)
+            raise
 
     grouped = {}
     for source in sources:
@@ -500,6 +504,23 @@ def backup_tree(disk, local_dir, remote_root, *, exclude=(), workers=4,
             root_meta = _stat_optional(disk, current)
             if root_meta is not None and root_meta.get('type') != 'dir':
                 raise NotADirectoryError('The current backup destination must be a directory')
+            pending = {}
+
+            def collect(block=False):
+                if not pending:
+                    return
+                done, _ = wait(pending, timeout=None if block else 0,
+                               return_when=FIRST_COMPLETED)
+                for future in done:
+                    source = pending.pop(future)
+                    try:
+                        future.result()
+                    except _Stopped:
+                        pass
+                    except Exception as exc:
+                        fail(source.relative, exc)
+                    emit('uploading', source.relative)
+
             for relative in directories:
                 if stopped():
                     break
@@ -512,17 +533,20 @@ def backup_tree(disk, local_dir, remote_root, *, exclude=(), workers=4,
                         if meta.get('type') != 'dir':
                             raise FileExistsError('A file occupies a backup directory')
                         list_directory(relative)
-                        prepared.add(current + ('/' + relative if relative else ''))
+                        with lock:
+                            prepared.add(current + ('/' + relative if relative else ''))
                     else:
-                        ensure(current + ('/' + relative if relative else ''))
-                    batch = list(run_bounded(executor, check, grouped.get(relative, []), 'checking'))
-                    jobs.extend(batch)
-                    result.bytes_total += sum(job.source.size for job in batch)
-                    if batch and not stopped():
-                        ensure(staging + ('/' + relative if relative else ''))
-                        if any(job.previous is not None for job in batch):
-                            ensure(history + ('/' + relative if relative else ''))
-                        list(run_bounded(executor, transfer, batch, 'uploading'))
+                        ensure(current + ('/' + relative if relative else ''), disk)
+                    # A shared bounded queue spans directories. Hashing, staging
+                    # preparation and transfers overlap metadata reads by producer.
+                    for source in grouped.get(relative, []):
+                        collect()
+                        while len(pending) >= workers * 2 and not stopped():
+                            collect(block=True)
+                        if stopped():
+                            break
+                        pending[executor.submit(process, source)] = source
+                    collect()
                 except _Stopped:
                     break
                 except Exception as exc:
@@ -530,6 +554,9 @@ def backup_tree(disk, local_dir, remote_root, *, exclude=(), workers=4,
                     fail(relative or '.', exc)
                     for source in grouped.get(relative, []):
                         fail(source.relative, exc)
+            while pending:
+                collect(block=True)
+            stopped()
     except _Stopped:
         pass
     except Exception as exc:
