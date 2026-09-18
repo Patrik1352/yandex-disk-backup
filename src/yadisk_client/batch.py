@@ -172,9 +172,38 @@ class BatchMixin:
                 jobs.append((path, remote.rstrip('/') + '/' + relative, path.stat().st_size))
         # Complete local plan before changing the remote tree.
         self.mkdir(remote, parents=True, exist_ok=True)
-        for relative in directories[1:]:
-            self.mkdir(remote.rstrip('/') + '/' + relative, exist_ok=True)
+        self._mkdir_tree(remote, directories[1:], workers=workers)
         return self._batch(jobs, 'upload', workers=workers, overwrite=overwrite, progress=progress, skipped=skipped)
+
+    def _mkdir_tree(self, remote, relatives, *, workers):
+        """Create subdirectories level by level: parents before children,
+        parallel within a level. Sequential mkdir here was the dominant cost
+        on reruns (existing dirs cost a PUT + a stat round trip each)."""
+        if not relatives:
+            return
+        by_depth = {}
+        for relative in relatives:
+            by_depth.setdefault(relative.count('/'), []).append(relative)
+        thread = threading.local()
+        lock = threading.Lock()
+        clients = []
+
+        def make(relative):
+            if not hasattr(thread, 'client'):
+                thread.client = type(self)(**self._worker_options)
+                with lock:
+                    clients.append(thread.client)
+            thread.client.mkdir(remote.rstrip('/') + '/' + relative, exist_ok=True)
+        try:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                for depth in sorted(by_depth):
+                    level = by_depth[depth]
+                    futures = [executor.submit(make, r) for r in level]
+                    for f in futures:
+                        f.result()
+        finally:
+            for client in clients:
+                client.close()
 
     def download_tree(self, remote_dir, local_dir, *, exclude=(), workers=4,
                       overwrite=False, progress=None) -> BatchResult:

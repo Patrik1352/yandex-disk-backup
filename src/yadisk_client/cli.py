@@ -134,22 +134,35 @@ def _print(value, args):
 
 
 class TerminalProgress:
-    def __init__(self, enabled):
-        self.enabled, self.last, self.visible = enabled, 0, False
+    """Interactive terminals get an in-place \\r-redrawn line. A non-terminal
+    stderr (redirected to a file/log, e.g. a backgrounded `nohup` run) gets
+    plain newline-terminated lines instead: a \\r-only stream is silent noise
+    in a log file, so without this a redirected run showed no progress at all."""
+    def __init__(self, enabled, *, tty=None):
+        self.enabled = enabled
+        self.tty = sys.stderr.isatty() if tty is None else tty
+        self.last, self.visible = 0, False
+        # Log lines are cheap but still throttled so a fast batch of tiny
+        # files doesn't spam one line per file.
+        self.log_interval = 0.15 if self.tty else 2.0
 
     def __call__(self, event):
         now = time.monotonic()
-        if not self.enabled or (not event.done and now - self.last < 0.15):
+        if not self.enabled or (not event.done and now - self.last < self.log_interval):
             return
         self.last = now
         eta = '?' if event.eta_seconds is None else f'{event.eta_seconds:.0f}s'
-        print(f'\r{event.direction}: {event.percent:6.1f}%  '
-              f'{event.bytes_per_second / 1e6:.2f} MB/s  ETA {eta}  '
-              f'files {event.files_completed}/{event.files_total}     ', end='', file=sys.stderr, flush=True)
+        line = (f'{event.direction}: {event.percent:6.1f}%  '
+                f'{event.bytes_per_second / 1e6:.2f} MB/s  ETA {eta}  '
+                f'files {event.files_completed}/{event.files_total}')
+        if self.tty:
+            print(f'\r{line}     ', end='', file=sys.stderr, flush=True)
+        else:
+            print(line, file=sys.stderr, flush=True)
         self.visible = True
 
     def close(self):
-        if self.visible:
+        if self.visible and self.tty:
             print(file=sys.stderr)
 
 
@@ -241,7 +254,7 @@ def _auth(args):
 
 def main(argv=None) -> int:
     args = parser().parse_args(argv)
-    display = TerminalProgress(not args.no_progress and not args.json and sys.stderr.isatty())
+    display = TerminalProgress(not args.no_progress and not args.json)
     try:
         if args.command == 'auth' and args.auth_command != 'check':
             _print(_auth(args), args)
