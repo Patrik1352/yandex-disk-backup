@@ -193,7 +193,22 @@ class BatchMixin:
                 thread.client = type(self)(**self._worker_options)
                 with lock:
                     clients.append(thread.client)
-            thread.client.mkdir(remote.rstrip('/') + '/' + relative, exist_ok=True)
+            path = remote.rstrip('/') + '/' + relative
+            # mkdir(exist_ok=True) is idempotent: a retry either creates the
+            # directory or finds it already there. The low-level request
+            # itself disables retries (mutating ops can't be safely replayed
+            # blindly), so a single transient server error must not abort
+            # the whole tree; retry here instead, at the safe/idempotent call.
+            last_exc = None
+            for attempt in range(4):
+                try:
+                    thread.client.mkdir(path, exist_ok=True)
+                    return
+                except (YandexDiskError, OSError) as exc:
+                    last_exc = exc
+                    if attempt < 3:
+                        time.sleep(2 ** attempt)
+            raise last_exc
         try:
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 for depth in sorted(by_depth):
