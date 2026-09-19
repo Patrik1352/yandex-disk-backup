@@ -31,7 +31,7 @@ def _options(parser):
 
 def parser():
     root = argparse.ArgumentParser(prog='yd', description='Yandex Disk files and directories')
-    root.add_argument('--version', action='version', version='yd 0.3.0')
+    root.add_argument('--version', action='version', version='yd 0.3.2')
     _options(root)
     root.set_defaults(env_file=os.environ.get('YADISK_ENV_FILE', '.env'), token_file=None,
                       json=False, no_progress=False, timeout=600, no_fast_upload=False)
